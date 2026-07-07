@@ -535,7 +535,7 @@ async def commands(ctx):
               f"Day **{WARNING_DAYS-1}** reminder DM\n"
               f"3 warnings = 24h mute\n"
               f"Weekly summary every Sunday\n"
-              f"Badges: 🌱→😊→🦋→💎→👑",
+              f"Badges: 💩→🪳→🐌→🦟→🐊→🦨→🐀",
         inline=False
     )
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
@@ -867,15 +867,17 @@ async def status(ctx):
     
     # Next badge
     if data['streak'] < 3:
-        next_badge = "😊 Friendly (3 days)"
-    elif data['streak'] < 7:
-        next_badge = "🦋 Social Butterfly (7 days)"
-    elif data['streak'] < 14:
-        next_badge = "💎 Master (14 days)"
+        next_badge = "🪳 Ipis na Buhay (3 days)"
+    elif data['streak'] < 5:
+        next_badge = "🐌 Sipsip sa Kanal (5 days)"
+    elif data['streak'] < 10:
+        next_badge = "🦟 Lamok sa Tenga (10 days)"
+    elif data['streak'] < 20:
+        next_badge = "🐊 Buwaya ng GC (20 days)"
     elif data['streak'] < 30:
-        next_badge = "👑 Legend (30 days)"
+        next_badge = "🦨 Amoy Imburnal (30 days)"
     else:
-        next_badge = "Max level reached!"
+        next_badge = "🐀 Daga ng Kanal (50 days)"
     
     embed.add_field(name="🎯 Next Badge", value=next_badge, inline=False)
     
@@ -958,10 +960,13 @@ async def forgive(ctx, member: discord.Member):
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
+    # FIX: Use discord.ext.commands.MissingPermissions directly
+    if isinstance(error, discord.ext.commands.MissingPermissions):
         await ctx.send("❌ You don't have permission to use this command.")
-    elif isinstance(error, commands.MissingRequiredArgument):
+    elif isinstance(error, discord.ext.commands.MissingRequiredArgument):
         await ctx.send(f"❌ Usage: `!{ctx.command.name} {ctx.command.signature}`")
+    elif isinstance(error, discord.ext.commands.CheckFailure):
+        await ctx.send("❌ You don't have permission to use this command.")
     else:
         print(f"Error: {error}")
 
