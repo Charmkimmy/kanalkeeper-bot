@@ -1,0 +1,4 @@
+.env
+kanalkeeper.db
+__pycache__/
+*.pyc
