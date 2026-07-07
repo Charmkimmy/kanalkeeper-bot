@@ -286,8 +286,23 @@ async def help(ctx):
 
 # ========== ADMIN COMMANDS ==========
 
+# FIX: Use bot.check for permissions instead of decorators
+def admin_check():
+    async def predicate(ctx):
+        if not ctx.guild:
+            return False
+        return ctx.author.guild_permissions.administrator
+    return commands.check(predicate)
+
+def mod_check():
+    async def predicate(ctx):
+        if not ctx.guild:
+            return False
+        return ctx.author.guild_permissions.manage_messages
+    return commands.check(predicate)
+
 @bot.command()
-@commands.has_permissions(administrator=True)
+@admin_check()
 async def setchannel(ctx, channel: discord.TextChannel):
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute("""
@@ -299,7 +314,7 @@ async def setchannel(ctx, channel: discord.TextChannel):
     await ctx.send(f"✅ Warning tickets will go to {channel.mention}")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+@admin_check()
 async def toggle(ctx):
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
@@ -320,7 +335,7 @@ async def toggle(ctx):
     await ctx.send(f"KanalKeeper {status}")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+@admin_check()
 async def settings(ctx):
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
@@ -391,7 +406,7 @@ async def leaderboard(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
-@commands.has_permissions(manage_messages=True)
+@mod_check()
 async def warnlist(ctx):
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
@@ -415,7 +430,7 @@ async def warnlist(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
-@commands.has_permissions(manage_messages=True)
+@mod_check()
 async def forgive(ctx, member: discord.Member):
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
