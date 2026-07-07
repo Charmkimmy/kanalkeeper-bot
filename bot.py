@@ -9,10 +9,8 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# ========== WARNING DAYS CONFIG ==========
 WARNING_DAYS = 5
 
-# ========== MORE GREETING WORDS ==========
 GREETING_WORDS = [
     "hi", "hello", "hey", "howdy", "greetings", "welcome",
     "good morning", "good afternoon", "good evening", "good night",
@@ -28,7 +26,7 @@ GREETING_WORDS = [
     "buenos dias", "buenas tardes", "buenas noches",
     "que tal", "como estas", "hola a todos",
     "wassup", "wasup", "whats up", "what up", "yo yo",
-    "heya", "ello", "hullo", "ahoy", "greetings earthlings",
+    "heya", "ello", "hullo", "ahoy",
     "top of the morning", "rise and shine", "good day",
     "pleased to meet you", "nice to meet you", "sup guys",
     "yo everyone", "yo all", "hello peeps", "hi peeps",
@@ -41,13 +39,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ========== DATABASE ==========
 
 async def init_db():
     async with aiosqlite.connect("kanalkeeper.db") as db:
-        # Users table (works across all servers)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER,
@@ -59,8 +56,6 @@ async def init_db():
                 PRIMARY KEY (user_id, guild_id)
             )
         """)
-        
-        # Warnings table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS warnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,13 +65,10 @@ async def init_db():
                 reason TEXT
             )
         """)
-        
-        # Server settings table (admin-configurable)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 warning_channel_id INTEGER,
-                admin_role_id INTEGER,
                 enabled INTEGER DEFAULT 1
             )
         """)
@@ -101,7 +93,6 @@ async def record_greeting(user, guild_id):
         await db.commit()
 
 async def get_warning_channel(guild_id):
-    """Get the warning channel for a server, or None if not set"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -115,23 +106,19 @@ async def get_warning_channel(guild_id):
 @bot.event
 async def on_ready():
     print(f"👋 KanalKeeper is online! Logged in as {bot.user}")
-    print(f"📅 Warning system: {WARNING_DAYS} days without greetings")
-    print(f"🔍 Tracking greetings in ALL channels across ALL servers")
+    print(f"📅 Warning system: {WARNING_DAYS} days")
+    print(f"🌐 Connected to {len(bot.guilds)} servers!")
     await init_db()
     daily_check.start()
 
 @bot.event
 async def on_guild_join(guild):
-    """When bot joins a new server, welcome message"""
     print(f"🎉 Joined new server: {guild.name} (ID: {guild.id})")
-    
-    # Try to find a general/welcome channel
     welcome_channel = None
     for channel in guild.text_channels:
         if "general" in channel.name.lower() or "welcome" in channel.name.lower():
             welcome_channel = channel
             break
-    
     if not welcome_channel:
         welcome_channel = guild.system_channel or guild.text_channels[0]
     
@@ -153,7 +140,7 @@ async def on_guild_join(guild):
         )
         embed.add_field(
             name="Commands",
-            value="`!status` - Check your stats\n`!leaderboard` - Top greeters",
+            value="`!commands` — See all commands\n`!status` — Check your stats\n`!leaderboard` — Top greeters",
             inline=False
         )
         embed.set_footer(text="KanalKeeper • Keeping channels active")
@@ -161,10 +148,11 @@ async def on_guild_join(guild):
 
 @bot.event
 async def on_message(message):
+    # Ignore bot messages
     if message.author.bot:
         return
     
-    # Ignore DMs
+    # Ignore DMs - only work in servers
     if not message.guild:
         return
     
@@ -177,10 +165,10 @@ async def on_message(message):
         if result and result[0] == 0:
             return  # Bot disabled for this server
     
-    # Track greetings in ANY channel
+    # Track greetings in ANY channel of ANY server
     if is_greeting(message.content):
         await record_greeting(message.author, message.guild.id)
-        print(f"👋 {message.author} greeted in #{message.channel.name} | Server: {message.guild.name}")
+        print(f"👋 {message.author} greeted in #{message.channel.name} | Server: {message.guild.name} (ID: {message.guild.id})")
     
     await bot.process_commands(message)
 
@@ -191,24 +179,33 @@ async def daily_check():
     today = datetime.now().strftime("%Y-%m-%d")
     days_ago = (datetime.now() - timedelta(days=WARNING_DAYS)).strftime("%Y-%m-%d")
     
-    print(f"🔍 Checking for inactive users (>{WARNING_DAYS} days)...")
+    print(f"🔍 Checking for inactive users across all servers...")
     
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         
-        # Get all enabled guilds
-        cursor = await db.execute("SELECT guild_id FROM guild_settings WHERE enabled = 1")
-        enabled_guilds = await cursor.fetchall()
-        guild_ids = [g["guild_id"] for g in enabled_guilds]
-        
-        # Also check guilds not in settings (default enabled)
+        # Get all guilds that have users tracked
         cursor = await db.execute("SELECT DISTINCT guild_id FROM users")
         all_guilds = await cursor.fetchall()
-        for g in all_guilds:
-            if g["guild_id"] not in guild_ids:
-                guild_ids.append(g["guild_id"])
         
-        for guild_id in guild_ids:
+        for guild_row in all_guilds:
+            guild_id = guild_row["guild_id"]
+            
+            # Check if this guild has the bot
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                print(f"⚠️ Guild {guild_id} not found, skipping...")
+                continue
+            
+            # Check if bot is enabled for this guild
+            cursor = await db.execute(
+                "SELECT enabled FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            )
+            result = await cursor.fetchone()
+            if result and result[0] == 0:
+                print(f"⏸️ Guild {guild.name} is disabled, skipping...")
+                continue
+            
             # Find inactive users in this guild
             cursor = await db.execute("""
                 SELECT user_id, username, last_greeting, warnings 
@@ -217,6 +214,7 @@ async def daily_check():
             """, (guild_id, days_ago))
             
             inactive = await cursor.fetchall()
+            print(f"📊 Guild {guild.name}: {len(inactive)} inactive users")
             
             for user in inactive:
                 user_id = user["user_id"]
@@ -259,7 +257,7 @@ async def send_warning(guild_id, user_id, username, warning_count, last_greeting
         embed.set_footer(text="KanalKeeper • Keeping our channel active")
         await user.send(embed=embed)
     except Exception as e:
-        print(f"❌ Could not DM user: {e}")
+        print(f"❌ Could not DM user {user_id}: {e}")
     
     # Post in warning channel
     embed = discord.Embed(
@@ -275,8 +273,60 @@ async def send_warning(guild_id, user_id, username, warning_count, last_greeting
     if warning_count >= 3:
         embed.add_field(name="⚠️ Note", value="Multiple warnings received. Please stay active!", inline=False)
     
-    embed.set_footer(text="KanalKeeper • Keeping our channel active")
+    embed.set_footer(text=f"KanalKeeper • Server ID: {guild_id}")
     await channel.send(embed=embed)
+
+# ========== HELP / COMMANDS LIST ==========
+
+@bot.command()
+async def commands(ctx):
+    """Show all available commands based on user permissions"""
+    
+    # Check permissions
+    is_admin = ctx.author.guild_permissions.administrator if ctx.guild else False
+    is_mod = ctx.author.guild_permissions.manage_messages if ctx.guild else False
+    
+    embed = discord.Embed(
+        title="📋 KanalKeeper Commands",
+        description="Here are all the commands you can use!",
+        color=discord.Color.blue()
+    )
+    
+    # User commands (everyone can see)
+    user_cmds = "`!status` — Check your greeting stats\n" \
+                "`!leaderboard` — See top greeters in this server\n" \
+                "`!commands` — Show this help message"
+    embed.add_field(name="👤 User Commands", value=user_cmds, inline=False)
+    
+    # Mod commands
+    if is_mod or is_admin:
+        mod_cmds = "`!warnlist` — See all active warnings\n" \
+                   "`!forgive @user` — Clear a user's warnings"
+        embed.add_field(name="🛡️ Mod Commands", value=mod_cmds, inline=False)
+    
+    # Admin commands
+    if is_admin:
+        admin_cmds = "`!setchannel #channel` — Set warning tickets channel\n" \
+                     "`!toggle` — Enable/disable KanalKeeper\n" \
+                     "`!settings` — View current server settings"
+        embed.add_field(name="⚙️ Admin Commands", value=admin_cmds, inline=False)
+    
+    # Bot info
+    embed.add_field(
+        name="ℹ️ About",
+        value=f"Warning after **{WARNING_DAYS}** days of no greetings\n" \
+              f"Tracking greetings in **all channels** across **all servers**",
+        inline=False
+    )
+    
+    embed.set_footer(text=f"Requested by {ctx.author.display_name} | KanalKeeper")
+    await ctx.send(embed=embed)
+
+# Alias for !help
+@bot.command()
+async def help(ctx):
+    """Show help (same as !commands)"""
+    await commands(ctx)
 
 # ========== ADMIN COMMANDS ==========
 
@@ -296,6 +346,7 @@ async def setchannel(ctx, channel: discord.TextChannel):
         description=f"Warning tickets will now be posted in {channel.mention}",
         color=discord.Color.green()
     )
+    embed.set_footer(text="KanalKeeper • Admin Configuration")
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -308,7 +359,6 @@ async def toggle(ctx):
             "SELECT enabled FROM guild_settings WHERE guild_id = ?", (ctx.guild.id,)
         )
         result = await cursor.fetchone()
-        
         current = result["enabled"] if result else 1
         new_status = 0 if current == 1 else 1
         
@@ -319,9 +369,11 @@ async def toggle(ctx):
         await db.commit()
     
     status = "enabled ✅" if new_status == 1 else "disabled ❌"
+    color = discord.Color.green() if new_status == 1 else discord.Color.red()
+    
     embed = discord.Embed(
         title=f"KanalKeeper {status}",
-        color=discord.Color.green() if new_status == 1 else discord.Color.red()
+        color=color
     )
     await ctx.send(embed=embed)
 
@@ -353,16 +405,16 @@ async def settings(ctx):
         embed.add_field(name="Status", value="Enabled (default)", inline=True)
     
     embed.add_field(name="Warning Days", value=str(WARNING_DAYS), inline=True)
+    embed.add_field(name="Server ID", value=str(ctx.guild.id), inline=True)
     await ctx.send(embed=embed)
 
 # ========== USER COMMANDS ==========
 
 @bot.command()
 async def status(ctx):
-    """Check your greeting stats"""
+    """Check your greeting stats for this server"""
     if not ctx.guild:
-        await ctx.send("This command only works in servers!")
-        return
+        return await ctx.send("❌ This command only works in servers!")
     
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
@@ -380,11 +432,10 @@ async def status(ctx):
         )
     else:
         embed = discord.Embed(
-            title=f"📊 {ctx.author.display_name}'s KanalKeeper Stats",
+            title=f"📊 {ctx.author.display_name}'s Stats",
             color=discord.Color.green() if data['warnings'] == 0 else discord.Color.orange()
         )
         embed.add_field(name="🔥 Streak", value=f"{data['streak']} days", inline=True)
-        embed.add_field(name="👋 Total Greetings", value=str(data['streak']), inline=True)
         embed.add_field(name="⚠️ Warnings", value=str(data['warnings']), inline=True)
         embed.add_field(name="📅 Last Greeting", value=data['last_greeting'] or "Never", inline=True)
         
@@ -395,29 +446,26 @@ async def status(ctx):
         else:
             embed.add_field(name="Status", value="🟢 All Good — Keep greeting!", inline=False)
     
+    embed.set_footer(text=f"Server: {ctx.guild.name}")
     await ctx.send(embed=embed)
 
 @bot.command()
 async def leaderboard(ctx):
     """Top greeters in this server"""
     if not ctx.guild:
-        await ctx.send("This command only works in servers!")
-        return
+        return await ctx.send("❌ This command only works in servers!")
     
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
-            SELECT username, streak, total_greetings 
-            FROM users 
-            WHERE guild_id = ?
-            ORDER BY streak DESC 
-            LIMIT 10
+            SELECT username, streak FROM users 
+            WHERE guild_id = ? ORDER BY streak DESC LIMIT 10
         """, (ctx.guild.id,))
         top_users = await cursor.fetchall()
     
     embed = discord.Embed(
         title="🏆 Greeting Leaderboard",
-        description=f"Top greeters in {ctx.guild.name}!",
+        description=f"Top greeters in **{ctx.guild.name}**!",
         color=discord.Color.gold()
     )
     
@@ -438,41 +486,43 @@ async def leaderboard(ctx):
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def warnlist(ctx):
-    """[MOD] See all warnings in this server"""
+    """See all warnings in this server"""
     if not ctx.guild:
-        await ctx.send("This command only works in servers!")
-        return
+        return await ctx.send("❌ This command only works in servers!")
     
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
             SELECT w.*, u.username FROM warnings w
             JOIN users u ON w.user_id = u.user_id AND w.guild_id = u.guild_id
-            WHERE w.guild_id = ?
-            ORDER BY w.date DESC LIMIT 20
+            WHERE w.guild_id = ? ORDER BY w.date DESC LIMIT 20
         """, (ctx.guild.id,))
         warnings = await cursor.fetchall()
     
     if not warnings:
-        await ctx.send("✅ No active warnings in this server!")
-        return
+        return await ctx.send("✅ No active warnings in this server!")
     
-    embed = discord.Embed(title="⚠️ KanalKeeper Warning List", color=discord.Color.red())
+    embed = discord.Embed(
+        title="⚠️ KanalKeeper Warning List",
+        description=f"Warnings in **{ctx.guild.name}**",
+        color=discord.Color.red()
+    )
+    
     for w in warnings:
         embed.add_field(
             name=f"{w['username']} — {w['date']}",
             value=w['reason'],
             inline=False
         )
+    
     await ctx.send(embed=embed)
 
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 async def forgive(ctx, member: discord.Member):
-    """[MOD] Clear a user's warnings in this server"""
+    """Clear a user's warnings in this server"""
     if not ctx.guild:
-        await ctx.send("This command only works in servers!")
-        return
+        return await ctx.send("❌ This command only works in servers!")
     
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute(
@@ -499,7 +549,7 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         embed = discord.Embed(
             title="❌ Permission Denied",
-            description="You need administrator/mod permissions to use this command.",
+            description="You don't have permission to use this command.",
             color=discord.Color.red()
         )
         await ctx.send(embed=embed)
@@ -507,6 +557,13 @@ async def on_command_error(ctx, error):
         embed = discord.Embed(
             title="❌ Missing Argument",
             description=f"Usage: `!{ctx.command.name} {ctx.command.signature}`",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+    elif isinstance(error, commands.BadArgument):
+        embed = discord.Embed(
+            title="❌ Invalid Argument",
+            description="Please check your command and try again.",
             color=discord.Color.red()
         )
         await ctx.send(embed=embed)
