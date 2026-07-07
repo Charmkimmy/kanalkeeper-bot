@@ -331,7 +331,7 @@ async def help(ctx):
 # ========== ADMIN COMMANDS ==========
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+
 async def setchannel(ctx, channel: discord.TextChannel):
     """Set the warning ticket channel for this server"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
@@ -350,7 +350,7 @@ async def setchannel(ctx, channel: discord.TextChannel):
     await ctx.send(embed=embed)
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+
 async def toggle(ctx):
     """Enable or disable KanalKeeper in this server"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
@@ -378,7 +378,7 @@ async def toggle(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
-@commands.has_permissions(administrator=True)
+
 async def settings(ctx):
     """View current server settings"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
