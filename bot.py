@@ -41,6 +41,20 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+# ========== STREAK BADGES ==========
+
+def get_badge(streak):
+    if streak >= 30:
+        return "👑 Legend"
+    elif streak >= 14:
+        return "💎 Master"
+    elif streak >= 7:
+        return "🦋 Social Butterfly"
+    elif streak >= 3:
+        return "😊 Friendly"
+    else:
+        return "🌱 Newbie"
+
 # ========== DATABASE ==========
 
 async def init_db():
@@ -110,6 +124,8 @@ async def on_ready():
     print(f"🌐 Connected to {len(bot.guilds)} servers!")
     await init_db()
     daily_check.start()
+    reminder_check.start()
+    weekly_summary.start()
 
 @bot.event
 async def on_guild_join(guild):
@@ -168,7 +184,7 @@ async def on_message(message):
     
     await bot.process_commands(message)
 
-# ========== DAILY CHECK ==========
+# ========== DAILY CHECK (WARNINGS) ==========
 
 @tasks.loop(hours=24)
 async def daily_check():
@@ -252,6 +268,169 @@ async def send_warning(guild_id, user_id, username, warning_count, last_greeting
     embed.add_field(name="Last Greeting", value=last_greeting or "Never", inline=True)
     await channel.send(embed=embed)
 
+# ========== FEATURE 1: DAILY REMINDER (Day 4) ==========
+
+@tasks.loop(hours=24)
+async def reminder_check():
+    """Send friendly reminder on day 4 (1 day before warning)"""
+    reminder_day = WARNING_DAYS - 1
+    reminder_days_ago = (datetime.now() - timedelta(days=reminder_day)).strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    print(f"📢 Sending day {reminder_day} reminders...")
+    
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT DISTINCT guild_id FROM users
+        """)
+        all_guilds = await cursor.fetchall()
+        
+        for guild_row in all_guilds:
+            guild_id = guild_row["guild_id"]
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+            
+            cursor = await db.execute(
+                "SELECT enabled FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            )
+            result = await cursor.fetchone()
+            if result and result[0] == 0:
+                continue
+            
+            # Find users at day 4 (1 day before warning)
+            cursor = await db.execute("""
+                SELECT user_id, username, last_greeting, streak 
+                FROM users 
+                WHERE guild_id = ? AND last_greeting = ?
+            """, (guild_id, reminder_days_ago))
+            
+            reminder_users = await cursor.fetchall()
+            
+            for user in reminder_users:
+                try:
+                    member = await bot.fetch_user(user["user_id"])
+                    embed = discord.Embed(
+                        title="⏰ Friendly Reminder",
+                        description=f"Hey {member.mention}! You haven't greeted anyone in **{reminder_day}** days.",
+                        color=discord.Color.yellow()
+                    )
+                    embed.add_field(
+                        name="⚠️ Heads Up",
+                        value=f"If you don't say hi today, you'll get a warning ticket tomorrow!",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="💡 How to Fix",
+                        value="Just say `hello` or `hi` in any channel! 👋",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="🔥 Your Streak",
+                        value=f"{user['streak']} days (will reset if you don't greet today)",
+                        inline=True
+                    )
+                    embed.set_footer(text="KanalKeeper • Keeping our community active")
+                    await member.send(embed=embed)
+                    print(f"📢 Reminder sent to {member.name}")
+                except Exception as e:
+                    print(f"❌ Could not send reminder: {e}")
+
+# ========== FEATURE 3: WEEKLY SUMMARY ==========
+
+@tasks.loop(hours=168)  # Every 7 days
+async def weekly_summary():
+    """Post weekly activity summary every Sunday"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT DISTINCT guild_id FROM guild_settings WHERE enabled = 1")
+        enabled_guilds = await cursor.fetchall()
+        
+        for guild_row in enabled_guilds:
+            guild_id = guild_row["guild_id"]
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+            
+            channel_id = await get_warning_channel(guild_id)
+            if not channel_id:
+                continue
+            
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                continue
+            
+            # Get weekly stats
+            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            
+            cursor = await db.execute("""
+                SELECT COUNT(*) as total_greetings FROM users 
+                WHERE guild_id = ? AND last_greeting >= ?
+            """, (guild_id, week_ago))
+            total_greetings = (await cursor.fetchone())["total_greetings"]
+            
+            cursor = await db.execute("""
+                SELECT username, streak FROM users 
+                WHERE guild_id = ? ORDER BY streak DESC LIMIT 1
+            """, (guild_id,))
+            top_user = await cursor.fetchone()
+            
+            cursor = await db.execute("""
+                SELECT COUNT(*) as warning_count FROM warnings 
+                WHERE guild_id = ? AND date >= ?
+            """, (guild_id, week_ago))
+            warnings = (await cursor.fetchone())["warning_count"]
+            
+            cursor = await db.execute("""
+                SELECT COUNT(*) as active_users FROM users 
+                WHERE guild_id = ? AND last_greeting >= ?
+            """, (guild_id, week_ago))
+            active_users = (await cursor.fetchone())["active_users"]
+            
+            # Create summary embed
+            embed = discord.Embed(
+                title="📊 Weekly KanalKeeper Report",
+                description=f"**{guild.name}** activity summary",
+                color=discord.Color.purple(),
+                timestamp=datetime.now()
+            )
+            
+            embed.add_field(
+                name="👋 Total Greetings",
+                value=str(total_greetings),
+                inline=True
+            )
+            embed.add_field(
+                name="👥 Active Members",
+                value=str(active_users),
+                inline=True
+            )
+            embed.add_field(
+                name="⚠️ Warnings Issued",
+                value=str(warnings),
+                inline=True
+            )
+            
+            if top_user:
+                embed.add_field(
+                    name="🏆 Top Greeter",
+                    value=f"{top_user['username']} — {get_badge(top_user['streak'])}\n🔥 {top_user['streak']} day streak",
+                    inline=False
+                )
+            
+            embed.add_field(
+                name="💡 Tip",
+                value="Keep greeting daily to maintain your streak and earn badges!",
+                inline=False
+            )
+            
+            embed.set_footer(text="KanalKeeper • Weekly Report")
+            await channel.send(embed=embed)
+            print(f"📊 Weekly summary sent to {guild.name}")
+
 # ========== HELP / COMMANDS LIST ==========
 
 @bot.command()
@@ -265,7 +444,7 @@ async def commands(ctx):
         color=discord.Color.blue()
     )
     
-    user_cmds = "`!status` — Check your greeting stats\n`!leaderboard` — See top greeters\n`!commands` — Show this help"
+    user_cmds = "`!status` — Check your greeting stats & badge\n`!leaderboard` — See top greeters\n`!commands` — Show this help"
     embed.add_field(name="👤 User Commands", value=user_cmds, inline=False)
     
     if is_mod or is_admin:
@@ -276,7 +455,14 @@ async def commands(ctx):
         admin_cmds = "`!setchannel #channel` — Set warning tickets channel\n`!toggle` — Enable/disable\n`!settings` — View settings"
         embed.add_field(name="⚙️ Admin Commands", value=admin_cmds, inline=False)
     
-    embed.add_field(name="ℹ️ About", value=f"Warning after **{WARNING_DAYS}** days\nTracking in **all channels**", inline=False)
+    embed.add_field(
+        name="ℹ️ About",
+        value=f"Warning after **{WARNING_DAYS}** days\n"
+              f"Day **{WARNING_DAYS-1}** reminder DM\n"
+              f"Weekly summary every Sunday\n"
+              f"Badges: 🌱→😊→🦋→💎→👑",
+        inline=False
+    )
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
     await ctx.send(embed=embed)
 
@@ -286,7 +472,6 @@ async def help(ctx):
 
 # ========== ADMIN COMMANDS ==========
 
-# Use discord.py's built-in checks correctly
 from discord.ext.commands import check
 
 def is_admin():
@@ -359,6 +544,8 @@ async def settings(ctx):
         embed.add_field(name="Status", value="Enabled (default)", inline=True)
     
     embed.add_field(name="Warning Days", value=str(WARNING_DAYS), inline=True)
+    embed.add_field(name="Reminder Day", value=f"Day {WARNING_DAYS-1}", inline=True)
+    embed.add_field(name="Weekly Summary", value="Every Sunday", inline=True)
     await ctx.send(embed=embed)
 
 # ========== USER COMMANDS ==========
@@ -379,10 +566,34 @@ async def status(ctx):
     if not data:
         return await ctx.send("No data yet! Start greeting! 👋")
     
-    embed = discord.Embed(title=f"📊 {ctx.author.display_name}'s Stats", color=discord.Color.blue())
+    badge = get_badge(data['streak'])
+    
+    embed = discord.Embed(
+        title=f"📊 {ctx.author.display_name}'s Stats",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="🏅 Badge", value=badge, inline=True)
     embed.add_field(name="🔥 Streak", value=f"{data['streak']} days", inline=True)
     embed.add_field(name="⚠️ Warnings", value=str(data['warnings']), inline=True)
     embed.add_field(name="📅 Last Greeting", value=data['last_greeting'] or "Never", inline=True)
+    
+    # Show next badge
+    if data['streak'] < 3:
+        next_badge = "😊 Friendly (3 days)"
+    elif data['streak'] < 7:
+        next_badge = "🦋 Social Butterfly (7 days)"
+    elif data['streak'] < 14:
+        next_badge = "💎 Master (14 days)"
+    elif data['streak'] < 30:
+        next_badge = "👑 Legend (30 days)"
+    else:
+        next_badge = "Max level reached!"
+    
+    embed.add_field(name="🎯 Next Badge", value=next_badge, inline=False)
+    
+    if data['warnings'] > 0:
+        embed.add_field(name="Status", value="🔴 At Risk — Say hi today!", inline=False)
+    
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -398,9 +609,20 @@ async def leaderboard(ctx):
         """, (ctx.guild.id,))
         top_users = await cursor.fetchall()
     
-    embed = discord.Embed(title="🏆 Leaderboard", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="🏆 Greeting Leaderboard",
+        color=discord.Color.gold()
+    )
+    
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    
     for i, user in enumerate(top_users):
-        embed.add_field(name=f"{i+1}. {user['username']}", value=f"🔥 {user['streak']} days", inline=False)
+        badge = get_badge(user['streak'])
+        embed.add_field(
+            name=f"{medals[i]} {user['username']} {badge}",
+            value=f"🔥 {user['streak']} day streak",
+            inline=False
+        )
     
     if not top_users:
         embed.description = "No data yet! Be first! 👋"
