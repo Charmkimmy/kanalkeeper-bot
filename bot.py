@@ -303,6 +303,7 @@ async def sync_guild_members(guild):
 
 # ========== AI CHATBOT (DMs) ==========
 
+
 async def get_ai_response(user_id: int, user_message: str, username: str) -> str:
     if not ai_model:
         return "Sorry, I don't have an AI brain set up yet! But I'm still keeping an eye on your greetings 👀"
@@ -311,8 +312,6 @@ async def get_ai_response(user_id: int, user_message: str, username: str) -> str
         chat_histories[user_id] = []
 
     history = chat_histories[user_id]
-
-    # Keep only last 20 messages to save tokens
     if len(history) > 20:
         history = history[-20:]
         chat_histories[user_id] = history
@@ -320,35 +319,42 @@ async def get_ai_response(user_id: int, user_message: str, username: str) -> str
     system_prompt = (
         f"You are KanalKeeper, a friendly and witty Discord bot for the KNL (Kanalkonek) server. "
         f"You track daily greetings and keep the community active. "
-        f"You have a fun Filipino/PH community vibe — you can mix Tagalog and English naturally. "
-        f"You encourage members to greet daily (say hi, hello, mabuhay, etc.) or send GIFs. "
-        f"Members who don't greet for {WARNING_DAYS} days get warnings. 3 warnings = 24h mute (auto-unmuted after 1 day). "
+        f"You have a fun Filipino/PH community vibe — mix Tagalog and English naturally. "
         f"You are now chatting with {username} in a DM. "
-        f"Be helpful, fun, and keep responses concise (2-4 sentences max). "
-        f"If asked about bot commands, mention !status, !leaderboard, !help."
+        f"Keep responses concise (2-4 sentences). "
+        f"If asked about commands, mention !status, !leaderboard, !commands."
     )
 
-    # Build Gemini contents format (user/model turns)
     contents = []
     for msg in history:
         role = "user" if msg["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-    # Prepend system prompt to first user message or add as new user turn
     full_message = f"{system_prompt}\n\n{user_message}" if not contents else user_message
     contents.append({"role": "user", "parts": [{"text": full_message}]})
 
-    try:
-        response = await ai_model.aio.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=contents,
-        )
-        reply = response.text
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": reply})
-        return reply
-    except Exception as e:
-        print(f"❌ Gemini error: {e}")
-        return "Ay nako, my brain glitched! Try again in a bit 😅"
+    # Try a few model names in order (whichever your API key supports)
+    model_candidates = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
+    last_error = None
+
+    for model_name in model_candidates:
+        try:
+            response = await ai_model.aio.models.generate_content(
+                model=model_name,
+                contents=contents,
+            )
+            reply = (response.text or "").strip()
+            if not reply:
+                continue
+            history.append({"role": "user", "content": user_message})
+            history.append({"role": "assistant", "content": reply})
+            return reply
+        except Exception as e:
+            last_error = e
+            print(f"❌ Gemini error on {model_name}: {type(e).__name__}: {e}")
+            continue
+
+    return f"Ay nako, my brain glitched! ({type(last_error).__name__ if last_error else 'no reply'}) 😅"
+
 
 # ========== EVENTS ==========
 
@@ -446,11 +452,15 @@ async def on_message(message):
 
     # ── DM: AI Chatbot ──
     if not message.guild:
+        # Ignore commands in DMs (most are guild-only)
         if message.content.startswith("!"):
-            await bot.process_commands(message)
             return
         async with message.channel.typing():
-            reply = await get_ai_response(message.author.id, message.content, message.author.display_name)
+            reply = await get_ai_response(
+                message.author.id,
+                message.content,
+                message.author.display_name,
+            )
         await message.channel.send(reply)
         return
 
