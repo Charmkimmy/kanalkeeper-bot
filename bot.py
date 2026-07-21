@@ -3,14 +3,18 @@ from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import aiosqlite
 import os
-from dotenv import load_dotenv
+import asyncio
 
-load_dotenv()
+try:
+    from google import genai as google_genai
+    _gemini_available = True
+except ImportError:
+    _gemini_available = False
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 WARNING_DAYS = 5
-
 
 DEFAULT_GREETING_WORDS = [
     "hi", "hello", "hey", "howdy", "greetings", "welcome",
@@ -33,9 +37,9 @@ DEFAULT_GREETING_WORDS = [
     "yo everyone", "yo all", "hello peeps", "hi peeps",
     "hey peeps", "what's good", "wagwan", "how it going",
     "how's it going", "how you doing", "how you doin",
-    "sup yall", "sup y'all", "hey yall", "hey y'all", "gomo", 
-    "gomoni", "gomo ni", "gomoni ni", "gomo ni sa inyo", "gomoni ni sa inyo","GOMOO",
-    "Hallooo, g'aftie","GOMOOO",
+    "sup yall", "sup y'all", "hey yall", "hey y'all", "gomo",
+    "gomoni", "gomo ni", "gomoni ni", "gomo ni sa inyo", "gomoni ni sa inyo", "GOMOO",
+    "Hallooo, g'aftie", "GOMOOO",
 ]
 
 intents = discord.Intents.default()
@@ -43,6 +47,18 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# Gemini client (for AI chatbot)
+if _gemini_available and GEMINI_API_KEY:
+    ai_model = google_genai.Client(api_key=GEMINI_API_KEY)
+else:
+    ai_model = None
+
+# In-memory chat history per DM user (keeps context)
+chat_histories: dict[int, list[dict]] = {}
+
+# Deduplication: track recently processed message IDs to prevent double-handling
+_processed_message_ids: set = set()
 
 # ========== STREAK BADGES ==========
 
@@ -66,12 +82,6 @@ def get_badge(streak):
 
 async def init_db():
     async with aiosqlite.connect("kanalkeeper.db") as db:
-        # Users table
-        # last_greeting: date of the user's last REAL counted greeting, or NULL
-        #   if they've never greeted (used for consecutive-streak math).
-        # joined_at: date the user was first tracked (join or sync). Used
-        #   only for the warning grace period, so it never gets confused
-        #   with an actual greeting date.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER,
@@ -82,15 +92,20 @@ async def init_db():
                 warnings INTEGER DEFAULT 0,
                 frozen_until TEXT,
                 joined_at TEXT,
+                muted_until TEXT,
                 PRIMARY KEY (user_id, guild_id)
             )
         """)
-        # Migration for pre-existing databases created before joined_at existed
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN joined_at TEXT")
-        except Exception:
-            pass  # column already exists
-        # Warnings table
+        # Migrations for older databases
+        for col_def in [
+            "ALTER TABLE users ADD COLUMN joined_at TEXT",
+            "ALTER TABLE users ADD COLUMN muted_until TEXT",
+        ]:
+            try:
+                await db.execute(col_def)
+            except Exception:
+                pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS warnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,15 +115,19 @@ async def init_db():
                 reason TEXT
             )
         """)
-        # Guild settings table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
                 guild_id INTEGER PRIMARY KEY,
                 warning_channel_id INTEGER,
-                enabled INTEGER DEFAULT 1
+                enabled INTEGER DEFAULT 1,
+                announce_channel_id INTEGER
             )
         """)
-        # Custom greeting words per guild
+        try:
+            await db.execute("ALTER TABLE guild_settings ADD COLUMN announce_channel_id INTEGER")
+        except Exception:
+            pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS custom_words (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,25 +135,18 @@ async def init_db():
                 word TEXT
             )
         """)
-        # Ignored channels
         await db.execute("""
             CREATE TABLE IF NOT EXISTS ignored_channels (
                 channel_id INTEGER PRIMARY KEY,
                 guild_id INTEGER
             )
         """)
-        # Desired/greeting channels (if a guild has any rows here, only these
-        # channels are checked for greetings; otherwise all channels count,
-        # minus ignored_channels)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS greeting_channels (
                 channel_id INTEGER PRIMARY KEY,
                 guild_id INTEGER
             )
         """)
-        # Log of individual counted greeting events (one row per user per day
-        # they greeted), used for accurate weekly "Total Greetings" stats
-        # separate from "Active Members" (distinct user count).
         await db.execute("""
             CREATE TABLE IF NOT EXISTS greeting_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,7 +155,6 @@ async def init_db():
                 date TEXT
             )
         """)
-        # Appeals
         await db.execute("""
             CREATE TABLE IF NOT EXISTS appeals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,9 +167,7 @@ async def init_db():
         await db.commit()
 
 async def get_all_greeting_words(guild_id):
-    """Get default + custom greeting words for a guild"""
     words = list(DEFAULT_GREETING_WORDS)
-    
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -168,7 +177,6 @@ async def get_all_greeting_words(guild_id):
         for row in custom:
             if row["word"] not in words:
                 words.append(row["word"])
-    
     return words
 
 async def is_channel_ignored(channel_id):
@@ -179,8 +187,6 @@ async def is_channel_ignored(channel_id):
         return await cursor.fetchone() is not None
 
 async def get_greeting_channels(guild_id):
-    """Return the set of channel IDs configured as 'desired' greeting channels
-    for this guild. Empty set means no restriction (all channels count)."""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         cursor = await db.execute(
             "SELECT channel_id FROM greeting_channels WHERE guild_id = ?", (guild_id,)
@@ -189,10 +195,6 @@ async def get_greeting_channels(guild_id):
         return {r[0] for r in rows}
 
 async def channel_counts_for_greeting(channel_id, guild_id):
-    """A channel counts for greeting detection if:
-    - it isn't in ignored_channels, AND
-    - either no greeting_channels are configured for the guild (detect everywhere),
-      or this channel IS one of the configured greeting_channels."""
     if await is_channel_ignored(channel_id):
         return False
     desired = await get_greeting_channels(guild_id)
@@ -201,24 +203,24 @@ async def channel_counts_for_greeting(channel_id, guild_id):
     return channel_id in desired
 
 def message_has_gif_attachment(message):
-    """True if the message has an attached image/GIF file."""
+    """True if the message has an attached image/GIF file or a Tenor/Giphy embed."""
     for attachment in message.attachments:
         content_type = (attachment.content_type or "").lower()
         filename = (attachment.filename or "").lower()
         if content_type.startswith("image/") or filename.endswith((".gif", ".png", ".jpg", ".jpeg", ".webp")):
             return True
+    # Also detect GIF embeds (Tenor/Giphy links auto-embed)
+    for embed in message.embeds:
+        if embed.type in ("gifv", "image"):
+            return True
+        if embed.url and any(g in (embed.url or "") for g in ["tenor.com", "giphy.com"]):
+            return True
     return False
-
-def is_greeting(text, guild_id):
-    text = text.lower()
-    # This will be async in the actual call, but for simplicity we'll handle it in on_message
-    return any(word in text for word in DEFAULT_GREETING_WORDS)
 
 async def record_greeting(user, guild_id):
     today = datetime.now().strftime("%Y-%m-%d")
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     async with aiosqlite.connect("kanalkeeper.db") as db:
-        # Check if user is frozen, and whether they already greeted today
         cursor = await db.execute(
             "SELECT frozen_until, last_greeting FROM users WHERE user_id = ? AND guild_id = ?",
             (user.id, guild_id)
@@ -227,30 +229,23 @@ async def record_greeting(user, guild_id):
         if result and result[0]:
             frozen_until = datetime.strptime(result[0], "%Y-%m-%d")
             if frozen_until > datetime.now():
-                return False  # User is frozen, don't record
+                return False
 
         previous_last_greeting = result[1] if result else None
         already_greeted_today = bool(previous_last_greeting == today)
 
-        # New rows use joined_at (not last_greeting) for the warning grace
-        # period, so an actual first greeting today still counts below.
         await db.execute("""
             INSERT OR IGNORE INTO users (user_id, guild_id, username, last_greeting, streak, joined_at)
             VALUES (?, ?, ?, NULL, 0, ?)
         """, (user.id, guild_id, str(user), today))
 
         if already_greeted_today:
-            # Only 1 greeting counts per day toward streak/leaderboard.
-            # Still keep username fresh, but don't touch streak or last_greeting.
             await db.execute("""
                 UPDATE users SET username = ? WHERE user_id = ? AND guild_id = ?
             """, (str(user), user.id, guild_id))
             await db.commit()
             return False
 
-        # Streak requires consecutive days: only continue it if the user's
-        # last real greeting was exactly yesterday. Any gap (or a first-ever
-        # greeting) resets the streak to 1.
         if previous_last_greeting == yesterday:
             new_streak_sql = "streak + 1"
         else:
@@ -277,12 +272,23 @@ async def get_warning_channel(guild_id):
         result = await cursor.fetchone()
         return result["warning_channel_id"] if result else None
 
+async def get_announce_channel(guild_id):
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT announce_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        )
+        result = await cursor.fetchone()
+        if result and result["announce_channel_id"]:
+            return result["announce_channel_id"]
+        # Fall back to warning channel
+        cursor = await db.execute(
+            "SELECT warning_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        )
+        result = await cursor.fetchone()
+        return result["warning_channel_id"] if result else None
+
 async def sync_guild_members(guild):
-    """Add every non-bot member of a guild to the users table if not already tracked.
-    Existing rows are left untouched (INSERT OR IGNORE), so this is safe to re-run.
-    New rows get joined_at = today for the warning grace period, while
-    last_greeting stays NULL until they actually greet — keeping the streak
-    math clean and letting a same-day first greeting still count."""
     today = datetime.now().strftime("%Y-%m-%d")
     async with aiosqlite.connect("kanalkeeper.db") as db:
         for member in guild.members:
@@ -295,6 +301,55 @@ async def sync_guild_members(guild):
         await db.commit()
     print(f"🔄 Synced members for {guild.name}")
 
+# ========== AI CHATBOT (DMs) ==========
+
+async def get_ai_response(user_id: int, user_message: str, username: str) -> str:
+    if not ai_model:
+        return "Sorry, I don't have an AI brain set up yet! But I'm still keeping an eye on your greetings 👀"
+
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+
+    history = chat_histories[user_id]
+
+    # Keep only last 20 messages to save tokens
+    if len(history) > 20:
+        history = history[-20:]
+        chat_histories[user_id] = history
+
+    system_prompt = (
+        f"You are KanalKeeper, a friendly and witty Discord bot for the KNL (Kanalkonek) server. "
+        f"You track daily greetings and keep the community active. "
+        f"You have a fun Filipino/PH community vibe — you can mix Tagalog and English naturally. "
+        f"You encourage members to greet daily (say hi, hello, mabuhay, etc.) or send GIFs. "
+        f"Members who don't greet for {WARNING_DAYS} days get warnings. 3 warnings = 24h mute (auto-unmuted after 1 day). "
+        f"You are now chatting with {username} in a DM. "
+        f"Be helpful, fun, and keep responses concise (2-4 sentences max). "
+        f"If asked about bot commands, mention !status, !leaderboard, !help."
+    )
+
+    # Build Gemini contents format (user/model turns)
+    contents = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+    # Prepend system prompt to first user message or add as new user turn
+    full_message = f"{system_prompt}\n\n{user_message}" if not contents else user_message
+    contents.append({"role": "user", "parts": [{"text": full_message}]})
+
+    try:
+        response = await ai_model.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=contents,
+        )
+        reply = response.text
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": reply})
+        return reply
+    except Exception as e:
+        print(f"❌ Gemini error: {e}")
+        return "Ay nako, my brain glitched! Try again in a bit 😅"
+
 # ========== EVENTS ==========
 
 @bot.event
@@ -304,8 +359,6 @@ async def on_ready():
     print(f"🌐 Connected to {len(bot.guilds)} servers!")
     await init_db()
 
-    # Make sure every existing human member is tracked, not just people
-    # who have already said a greeting at least once. Bots are skipped.
     for guild in bot.guilds:
         try:
             await sync_guild_members(guild)
@@ -315,12 +368,12 @@ async def on_ready():
     daily_check.start()
     reminder_check.start()
     weekly_summary.start()
+    auto_unmute_check.start()
+    daily_announce_6pm.start()
+    daily_announce_midnight.start()
 
 @bot.event
 async def on_member_join(member):
-    """Start tracking a member the moment they join — unless they're a bot.
-    They get joined_at = today for the grace period; last_greeting stays
-    NULL so a genuine greeting on their join day still counts as day 1."""
     if member.bot:
         return
     today = datetime.now().strftime("%Y-%m-%d")
@@ -332,12 +385,9 @@ async def on_member_join(member):
         await db.commit()
     print(f"➕ Now tracking {member} in {member.guild.name}")
 
-
 @bot.event
 async def on_guild_join(guild):
     print(f"🎉 Joined new server: {guild.name} (ID: {guild.id})")
-
-    # Track all existing non-bot members of the server we just joined
     try:
         await sync_guild_members(guild)
     except Exception as e:
@@ -350,21 +400,24 @@ async def on_guild_join(guild):
             break
     if not welcome_channel:
         welcome_channel = guild.system_channel or guild.text_channels[0]
-    
+
     if welcome_channel:
         embed = discord.Embed(
             title="👋 KanalKeeper has arrived!",
-            description="I'll help keep your server active and welcoming!",
+            description="I'll help keep your server active and welcoming!\n\nYou can also DM me — I have AI chat! 🤖",
             color=discord.Color.green()
         )
         embed.add_field(
             name="How it works",
-            value=f"Members who don't greet anyone for **{WARNING_DAYS} days** get a warning ticket.",
+            value=f"Members who don't greet anyone for **{WARNING_DAYS} days** get a warning ticket.\n"
+                  f"Say **hi**, **hello**, **mabuhay** or send a **GIF** to count!",
             inline=False
         )
         embed.add_field(
             name="Admin Setup",
-            value="Use `!setchannel #channel` to set where warning tickets go.\nUse `!toggle` to enable/disable me.",
+            value="Use `!setchannel #channel` to set where warning tickets go.\n"
+                  "Use `!setannouncechannel #channel` to set where daily roll-call announcements go.\n"
+                  "Use `!toggle` to enable/disable me.",
             inline=False
         )
         embed.add_field(
@@ -379,37 +432,49 @@ async def on_guild_join(guild):
 async def on_message(message):
     if message.author.bot:
         return
-    
-    if not message.guild:
+
+    # Ignore webhook-sourced messages (e.g. channel mirrors) to prevent double processing
+    if message.webhook_id:
         return
-    
+
+    # Deduplicate — skip if this message ID was already processed (guards against reconnect replays)
+    if message.id in _processed_message_ids:
+        return
+    _processed_message_ids.add(message.id)
+    if len(_processed_message_ids) > 2000:
+        _processed_message_ids.clear()
+
+    # ── DM: AI Chatbot ──
+    if not message.guild:
+        if message.content.startswith("!"):
+            await bot.process_commands(message)
+            return
+        async with message.channel.typing():
+            reply = await get_ai_response(message.author.id, message.content, message.author.display_name)
+        await message.channel.send(reply)
+        return
+
+    # ── Guild messages ──
     async with aiosqlite.connect("kanalkeeper.db") as db:
         cursor = await db.execute(
             "SELECT enabled FROM guild_settings WHERE guild_id = ?", (message.guild.id,)
         )
         result = await cursor.fetchone()
         if result and result[0] == 0:
+            await bot.process_commands(message)
             return
 
-    # Only channels ignored, or (if configured) not one of the desired
-    # greeting channels, are excluded from detection.
     if await channel_counts_for_greeting(message.channel.id, message.guild.id):
         desired = await get_greeting_channels(message.guild.id)
 
         if desired and message.channel.id in desired:
-            # This is a configured "desired" greeting channel — ANY chat
-            # message counts as a greeting (words/GIFs no longer required
-            # here), except bot commands like !status which aren't chat.
             if not message.content.startswith(bot.command_prefix):
                 success = await record_greeting(message.author, message.guild.id)
                 if success:
-                    print(f"👋 {message.author} greeted (chat) in #{message.channel.name} | Server: {message.guild.name}")
+                    print(f"👋 {message.author} greeted (chat) in #{message.channel.name} | {message.guild.name}")
         else:
-            # No desired channels configured (or this channel isn't restricted
-            # to a list) — fall back to requiring a greeting word or GIF/image.
             words = await get_all_greeting_words(message.guild.id)
             text = message.content.lower()
-
             is_word_greeting = any(word in text for word in words)
             is_gif_greeting = message_has_gif_attachment(message)
 
@@ -417,9 +482,131 @@ async def on_message(message):
                 success = await record_greeting(message.author, message.guild.id)
                 if success:
                     kind = "gif/image" if is_gif_greeting and not is_word_greeting else "text"
-                    print(f"👋 {message.author} greeted ({kind}) in #{message.channel.name} | Server: {message.guild.name}")
+                    print(f"👋 {message.author} greeted ({kind}) in #{message.channel.name} | {message.guild.name}")
 
     await bot.process_commands(message)
+
+# ========== AUTO-UNMUTE TASK ==========
+
+@tasks.loop(minutes=10)
+async def auto_unmute_check():
+    """Every 10 minutes: unmute anyone whose muted_until has passed."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT user_id, guild_id, username FROM users
+            WHERE muted_until IS NOT NULL AND muted_until <= ?
+        """, (now_str,))
+        expired = await cursor.fetchall()
+
+        for row in expired:
+            guild = bot.get_guild(row["guild_id"])
+            if not guild:
+                continue
+            member = guild.get_member(row["user_id"])
+            mute_role = discord.utils.get(guild.roles, name="Muted")
+            if member and mute_role and mute_role in member.roles:
+                try:
+                    await member.remove_roles(mute_role, reason="KanalKeeper: auto-unmute after 1 day")
+                    print(f"🔊 Auto-unmuted {row['username']} in {guild.name}")
+                except Exception as e:
+                    print(f"❌ Auto-unmute failed for {row['username']}: {e}")
+
+            # Clear muted_until regardless
+            await db.execute("""
+                UPDATE users SET muted_until = NULL WHERE user_id = ? AND guild_id = ?
+            """, (row["user_id"], row["guild_id"]))
+
+        if expired:
+            await db.commit()
+
+# ========== DAILY ROLL-CALL ANNOUNCE ==========
+
+async def post_daily_rollcall(label: str):
+    """Post a list of members who have NOT greeted today, in all enabled guilds."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT DISTINCT guild_id FROM users")
+        all_guilds = await cursor.fetchall()
+
+        for guild_row in all_guilds:
+            guild_id = guild_row["guild_id"]
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+
+            cursor = await db.execute(
+                "SELECT enabled FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            )
+            result = await cursor.fetchone()
+            if result and result[0] == 0:
+                continue
+
+            channel_id = await get_announce_channel(guild_id)
+            if not channel_id:
+                continue
+            channel = bot.get_channel(channel_id)
+            if not channel:
+                continue
+
+            # Members who haven't greeted today
+            cursor = await db.execute("""
+                SELECT user_id, username, last_greeting, streak FROM users
+                WHERE guild_id = ? AND (last_greeting IS NULL OR last_greeting < ?)
+                ORDER BY username
+            """, (guild_id, today))
+            not_greeted = await cursor.fetchall()
+
+            # Filter to only members still in the server (skip left members)
+            pending = []
+            for row in not_greeted:
+                member = guild.get_member(row["user_id"])
+                if member and not member.bot:
+                    pending.append((member, row["streak"]))
+
+            if not pending:
+                embed = discord.Embed(
+                    title=f"🎉 {label} Roll-Call — {today}",
+                    description="✅ **Everyone has greeted today!** Amazing community! 🥳",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now()
+                )
+                embed.set_footer(text="KanalKeeper • Daily Roll-Call")
+                await channel.send(embed=embed)
+                continue
+
+            # Build list (chunk to avoid embed limit)
+            mentions = "\n".join(
+                f"• {m.mention} {'🔥 ' + str(streak) + ' day streak' if streak > 0 else '💩 No streak'}"
+                for m, streak in pending
+            )
+            if len(mentions) > 3800:
+                mentions = mentions[:3800] + "\n…and more"
+
+            embed = discord.Embed(
+                title=f"📋 {label} Roll-Call — {today}",
+                description=(
+                    f"These **{len(pending)}** member(s) haven't greeted yet today.\n"
+                    f"Say **hi**, **hello**, **mabuhay** or send a GIF to check in! 👋\n\n"
+                    + mentions
+                ),
+                color=discord.Color.orange(),
+                timestamp=datetime.now()
+            )
+            embed.set_footer(text="KanalKeeper • Daily Roll-Call")
+            await channel.send(embed=embed)
+            print(f"📢 {label} roll-call posted in {guild.name} ({len(pending)} pending)")
+
+@tasks.loop(hours=24)
+async def daily_announce_6pm():
+    await post_daily_rollcall("6 PM")
+
+@tasks.loop(hours=24)
+async def daily_announce_midnight():
+    await post_daily_rollcall("12 AM")
 
 # ========== DAILY CHECK (WARNINGS) ==========
 
@@ -427,52 +614,49 @@ async def on_message(message):
 async def daily_check():
     today = datetime.now().strftime("%Y-%m-%d")
     days_ago = (datetime.now() - timedelta(days=WARNING_DAYS)).strftime("%Y-%m-%d")
-    
+
     print(f"🔍 Checking for inactive users across all servers...")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT DISTINCT guild_id FROM users")
         all_guilds = await cursor.fetchall()
-        
+
         for guild_row in all_guilds:
             guild_id = guild_row["guild_id"]
             guild = bot.get_guild(guild_id)
             if not guild:
                 continue
-            
+
             cursor = await db.execute(
                 "SELECT enabled FROM guild_settings WHERE guild_id = ?", (guild_id,)
             )
             result = await cursor.fetchone()
             if result and result[0] == 0:
                 continue
-            
+
             cursor = await db.execute("""
-                SELECT user_id, username, last_greeting, warnings 
-                FROM users 
+                SELECT user_id, username, last_greeting, warnings
+                FROM users
                 WHERE guild_id = ?
                   AND (
                         (last_greeting IS NOT NULL AND last_greeting <= ?)
                         OR (last_greeting IS NULL AND (joined_at IS NULL OR joined_at <= ?))
                       )
             """, (guild_id, days_ago, days_ago))
-            
+
             inactive = await cursor.fetchall()
-            
+
             for user in inactive:
                 user_id = user["user_id"]
-
-                # Double-check this isn't a bot account (defense in depth —
-                # bots should never even be in this table, but skip just in case)
                 member_obj = guild.get_member(user_id)
                 if member_obj and member_obj.bot:
                     continue
 
                 warnings = user["warnings"] + 1
-                
-                # Mute on 3 warnings
+
                 mute_role = None
+                muted_until_str = None
                 if warnings >= 3:
                     mute_role = discord.utils.get(guild.roles, name="Muted")
                     if not mute_role:
@@ -480,42 +664,43 @@ async def daily_check():
                             mute_role = await guild.create_role(name="Muted", reason="KanalKeeper auto-mute")
                             for channel in guild.channels:
                                 await channel.set_permissions(mute_role, send_messages=False)
-                        except:
+                        except Exception:
                             pass
-                
+                    # Set muted_until = now + 1 day
+                    muted_until_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
                 await db.execute("""
                     INSERT INTO warnings (user_id, guild_id, date, reason)
                     VALUES (?, ?, ?, ?)
                 """, (user_id, guild_id, today, f'{WARNING_DAYS} days without greetings'))
-                
+
                 await db.execute("""
-                    UPDATE users SET warnings = ? WHERE user_id = ? AND guild_id = ?
-                """, (warnings, user_id, guild_id))
+                    UPDATE users SET warnings = ?, muted_until = ?
+                    WHERE user_id = ? AND guild_id = ?
+                """, (warnings, muted_until_str, user_id, guild_id))
                 await db.commit()
-                
+
                 await send_warning(guild_id, user_id, user["username"], warnings, user["last_greeting"], mute_role)
 
 async def send_warning(guild_id, user_id, username, warning_count, last_greeting, mute_role=None):
     channel_id = await get_warning_channel(guild_id)
     if not channel_id:
         return
-    
+
     channel = bot.get_channel(channel_id)
     if not channel:
         return
-    
+
     guild = bot.get_guild(guild_id)
     member = guild.get_member(user_id) if guild else None
-    
-    # Apply mute if 3+ warnings
+
     if mute_role and member:
         try:
             await member.add_roles(mute_role, reason="KanalKeeper: 3+ warnings")
-            print(f"🔇 Muted {username} for 3+ warnings")
+            print(f"🔇 Muted {username} for 3+ warnings (auto-unmutes in 1 day)")
         except Exception as e:
             print(f"❌ Could not mute: {e}")
-    
-    # Try DM
+
     try:
         user = await bot.fetch_user(user_id)
         embed = discord.Embed(
@@ -525,13 +710,12 @@ async def send_warning(guild_id, user_id, username, warning_count, last_greeting
         )
         embed.add_field(name="Warning #", value=str(warning_count))
         if warning_count >= 3:
-            embed.add_field(name="🔇 MUTED", value="You've been muted for 24 hours due to multiple warnings.", inline=False)
-        embed.add_field(name="How to Fix", value="Say hi in any channel! 👋", inline=False)
+            embed.add_field(name="🔇 MUTED", value="You've been muted for **24 hours**. You'll be automatically unmuted after 1 day!", inline=False)
+        embed.add_field(name="How to Fix", value="Say **hi**, **hello**, **mabuhay** or send a GIF in any channel! 👋", inline=False)
         await user.send(embed=embed)
-    except:
+    except Exception:
         pass
-    
-    # Post in warning channel
+
     embed = discord.Embed(
         title="🎫 Warning Ticket",
         color=discord.Color.red() if warning_count >= 2 else discord.Color.orange(),
@@ -541,46 +725,47 @@ async def send_warning(guild_id, user_id, username, warning_count, last_greeting
     embed.add_field(name="Reason", value=f"{WARNING_DAYS} days no greetings", inline=False)
     embed.add_field(name="Warnings", value=str(warning_count), inline=True)
     embed.add_field(name="Last Greeting", value=last_greeting or "Never", inline=True)
-    
+
     if warning_count >= 3:
-        embed.add_field(name="🔇 ACTION TAKEN", value="User has been muted for 24 hours", inline=False)
-    
+        embed.add_field(name="🔇 ACTION TAKEN", value="User has been muted for 24 hours (auto-unmutes automatically)", inline=False)
+
     await channel.send(embed=embed)
 
+# ========== REMINDER CHECK ==========
 
 @tasks.loop(hours=24)
 async def reminder_check():
     reminder_day = WARNING_DAYS - 1
     reminder_days_ago = (datetime.now() - timedelta(days=reminder_day)).strftime("%Y-%m-%d")
-    
+
     print(f"📢 Sending day {reminder_day} reminders...")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT DISTINCT guild_id FROM users")
         all_guilds = await cursor.fetchall()
-        
+
         for guild_row in all_guilds:
             guild_id = guild_row["guild_id"]
             guild = bot.get_guild(guild_id)
             if not guild:
                 continue
-            
+
             cursor = await db.execute(
                 "SELECT enabled FROM guild_settings WHERE guild_id = ?", (guild_id,)
             )
             result = await cursor.fetchone()
             if result and result[0] == 0:
                 continue
-            
+
             cursor = await db.execute("""
-                SELECT user_id, username, last_greeting, streak 
-                FROM users 
+                SELECT user_id, username, last_greeting, streak
+                FROM users
                 WHERE guild_id = ? AND last_greeting = ? AND (frozen_until IS NULL OR frozen_until <= ?)
             """, (guild_id, reminder_days_ago, datetime.now().strftime("%Y-%m-%d")))
-            
+
             reminder_users = await cursor.fetchall()
-            
+
             for user in reminder_users:
                 try:
                     member = await bot.fetch_user(user["user_id"])
@@ -589,8 +774,8 @@ async def reminder_check():
                         description=f"Hey {member.mention}! You haven't greeted anyone in **{reminder_day}** days.",
                         color=discord.Color.yellow()
                     )
-                    embed.add_field(name="⚠️ Heads Up", value=f"If you don't say hi today, you'll get a warning ticket tomorrow!", inline=False)
-                    embed.add_field(name="💡 How to Fix", value="Just say `hello` or `hi` in any channel! 👋", inline=False)
+                    embed.add_field(name="⚠️ Heads Up", value="If you don't say hi today, you'll get a warning ticket tomorrow!", inline=False)
+                    embed.add_field(name="💡 How to Fix", value="Just say `hello`, `hi`, `mabuhay` or send a GIF in any channel! 👋", inline=False)
                     embed.add_field(name="🔥 Your Streak", value=f"{user['streak']} days", inline=True)
                     embed.set_footer(text="KanalKeeper • Keeping our community active")
                     await member.send(embed=embed)
@@ -598,72 +783,67 @@ async def reminder_check():
                 except Exception as e:
                     print(f"❌ Could not send reminder: {e}")
 
-# ========== FEATURE 3: WEEKLY SUMMARY ==========
+# ========== WEEKLY SUMMARY ==========
 
 @tasks.loop(hours=168)
 async def weekly_summary():
     today = datetime.now().strftime("%Y-%m-%d")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT DISTINCT guild_id FROM guild_settings WHERE enabled = 1")
         enabled_guilds = await cursor.fetchall()
-        
+
         for guild_row in enabled_guilds:
             guild_id = guild_row["guild_id"]
             guild = bot.get_guild(guild_id)
             if not guild:
                 continue
-            
+
             channel_id = await get_warning_channel(guild_id)
             if not channel_id:
                 continue
-            
+
             channel = bot.get_channel(channel_id)
             if not channel:
                 continue
-            
+
             week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            
-            # Total Greetings: actual count of counted greeting events this
-            # week (one per user per day they greeted), from greeting_log.
+
             cursor = await db.execute("""
                 SELECT COUNT(*) as total_greetings FROM greeting_log
                 WHERE guild_id = ? AND date >= ?
             """, (guild_id, week_ago))
             total_greetings = (await cursor.fetchone())["total_greetings"]
-            
+
             cursor = await db.execute("""
-                SELECT username, streak FROM users 
+                SELECT username, streak FROM users
                 WHERE guild_id = ? ORDER BY streak DESC LIMIT 1
             """, (guild_id,))
             top_user = await cursor.fetchone()
-            
+
             cursor = await db.execute("""
-                SELECT COUNT(*) as warning_count FROM warnings 
+                SELECT COUNT(*) as warning_count FROM warnings
                 WHERE guild_id = ? AND date >= ?
             """, (guild_id, week_ago))
             warnings = (await cursor.fetchone())["warning_count"]
-            
-            # Active Members: distinct users who greeted at all this week —
-            # a different, smaller-or-equal number than Total Greetings.
+
             cursor = await db.execute("""
                 SELECT COUNT(DISTINCT user_id) as active_users FROM greeting_log
                 WHERE guild_id = ? AND date >= ?
             """, (guild_id, week_ago))
             active_users = (await cursor.fetchone())["active_users"]
-            
+
             embed = discord.Embed(
                 title="📊 Weekly KanalKeeper Report",
                 description=f"**{guild.name}** activity summary",
                 color=discord.Color.purple(),
                 timestamp=datetime.now()
             )
-            
             embed.add_field(name="👋 Total Greetings", value=str(total_greetings), inline=True)
             embed.add_field(name="👥 Active Members", value=str(active_users), inline=True)
             embed.add_field(name="⚠️ Warnings Issued", value=str(warnings), inline=True)
-            
+
             if top_user:
                 badge = get_badge(top_user['streak'])
                 embed.add_field(
@@ -671,47 +851,73 @@ async def weekly_summary():
                     value=f"{top_user['username']} — {badge}\n🔥 {top_user['streak']} day streak",
                     inline=False
                 )
-            
+
             embed.add_field(name="💡 Tip", value="Keep greeting daily to maintain your streak and earn badges!", inline=False)
             embed.set_footer(text="KanalKeeper • Weekly Report")
             await channel.send(embed=embed)
             print(f"📊 Weekly summary sent to {guild.name}")
 
-# ========== HELP / COMMANDS LIST ==========
+# ========== COMMANDS ==========
 
 @bot.command()
 async def commands(ctx):
     is_admin = ctx.author.guild_permissions.administrator if ctx.guild else False
     is_mod = ctx.author.guild_permissions.manage_messages if ctx.guild else False
-    
+
     embed = discord.Embed(
         title="📋 KanalKeeper Commands",
         description="Here are all the commands you can use!",
         color=discord.Color.blue()
     )
-    
-    user_cmds = "`!status` — Check your greeting stats & badge\n`!leaderboard` — See top greeters\n`!commands` — Show this help\n`!appeal` — Request warning forgiveness"
+
+    user_cmds = (
+        "`!status` — Check your greeting stats & badge\n"
+        "`!leaderboard` — See top greeters\n"
+        "`!commands` — Show this help\n"
+        "`!appeal` — Request warning forgiveness"
+    )
     embed.add_field(name="👤 User Commands", value=user_cmds, inline=False)
-    
+
     if is_mod or is_admin:
-        mod_cmds = "`!warnlist` — See all active warnings\n`!forgive @user` — Clear a user's warnings\n`!freeze @user [days]` — Pause tracking\n`!ignore #channel` — Exclude channel from tracking\n`!addgreetingchannel #channel` — Only count greetings here\n`!removegreetingchannel #channel` — Remove restriction"
+        mod_cmds = (
+            "`!warnlist` — See all active warnings\n"
+            "`!forgive @user` — Clear a user's warnings\n"
+            "`!freeze @user [days]` — Pause tracking\n"
+            "`!unfreeze @user` — Resume tracking\n"
+            "`!ignore #channel` — Exclude channel from tracking\n"
+            "`!unignore #channel` — Re-enable channel\n"
+            "`!addgreetingchannel #channel` — Only count greetings here\n"
+            "`!removegreetingchannel #channel` — Remove restriction\n"
+            "`!unmute @user` — Manually unmute a user"
+        )
         embed.add_field(name="🛡️ Mod Commands", value=mod_cmds, inline=False)
-    
+
     if is_admin:
-        admin_cmds = "`!setchannel #channel` — Set warning tickets channel\n`!toggle` — Enable/disable\n`!settings` — View settings\n`!addword \"word\"` — Add custom greeting\n`!removeword \"word\"` — Remove custom greeting\n`!clearall` — Reset ALL warnings (new month)\n`!unmute @user` — Unmute a user"
+        admin_cmds = (
+            "`!setchannel #channel` — Set warning tickets channel\n"
+            "`!setannouncechannel #channel` — Set daily roll-call channel\n"
+            "`!toggle` — Enable/disable\n"
+            "`!settings` — View settings\n"
+            "`!addword \"word\"` — Add custom greeting\n"
+            "`!removeword \"word\"` — Remove custom greeting\n"
+            "`!clearall` — Reset ALL warnings (new month)\n"
+            "`!rollcall` — Post roll-call now"
+        )
         embed.add_field(name="⚙️ Admin Commands", value=admin_cmds, inline=False)
-    
+
     embed.add_field(
         name="ℹ️ About",
-        value=f"Warning after **{WARNING_DAYS}** days\n"
-              f"Day **{WARNING_DAYS-1}** reminder DM\n"
-              f"3 warnings = 24h mute\n"
-              f"In a desired greeting channel: **any** chat message counts\n"
-              f"Elsewhere: a greeting word or GIF/image attachment is needed\n"
-              f"Only **1** greeting per day counts toward your streak\n"
-              f"If greeting channels are set, only those channels count\n"
-              f"Weekly summary every Sunday\n"
-              f"Badges: 💩→🪳→🐌→🦟→🐊→🦨→🐀",
+        value=(
+            f"Warning after **{WARNING_DAYS}** days\n"
+            f"Day **{WARNING_DAYS-1}** reminder DM\n"
+            f"3 warnings = 24h mute (auto-unmuted!)\n"
+            f"Greetings: words **or** GIFs count\n"
+            f"'mabuhay' counts as a greeting ✅\n"
+            f"Only **1** greeting per day counts toward streak\n"
+            f"Roll-call announced at **6 PM** and **12 AM** daily\n"
+            f"DM me to chat with AI! 🤖\n"
+            f"Badges: 💩→🪳→🐌→🦟→🐊→🦨→🐀"
+        ),
         inline=False
     )
     embed.set_footer(text=f"Requested by {ctx.author.display_name}")
@@ -748,8 +954,34 @@ async def setchannel(ctx, channel: discord.TextChannel):
             VALUES (?, ?)
         """, (ctx.guild.id, channel.id))
         await db.commit()
-    
     await ctx.send(f"✅ Warning tickets will go to {channel.mention}")
+
+@bot.command()
+@admin_check()
+async def setannouncechannel(ctx, channel: discord.TextChannel):
+    """Set the channel where daily 6pm and 12am roll-call announcements are posted."""
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        cursor = await db.execute(
+            "SELECT guild_id FROM guild_settings WHERE guild_id = ?", (ctx.guild.id,)
+        )
+        exists = await cursor.fetchone()
+        if exists:
+            await db.execute("""
+                UPDATE guild_settings SET announce_channel_id = ? WHERE guild_id = ?
+            """, (channel.id, ctx.guild.id))
+        else:
+            await db.execute("""
+                INSERT INTO guild_settings (guild_id, announce_channel_id) VALUES (?, ?)
+            """, (ctx.guild.id, channel.id))
+        await db.commit()
+    await ctx.send(f"✅ Daily roll-call announcements will go to {channel.mention} at **6 PM** and **12 AM**.")
+
+@bot.command()
+@admin_check()
+async def rollcall(ctx):
+    """Manually trigger a roll-call announcement right now."""
+    await ctx.send("📋 Posting roll-call now...")
+    await post_daily_rollcall("Manual")
 
 @bot.command()
 @admin_check()
@@ -762,13 +994,13 @@ async def toggle(ctx):
         result = await cursor.fetchone()
         current = result["enabled"] if result else 1
         new_status = 0 if current == 1 else 1
-        
+
         await db.execute("""
             INSERT OR REPLACE INTO guild_settings (guild_id, enabled)
             VALUES (?, ?)
         """, (ctx.guild.id, new_status))
         await db.commit()
-    
+
     status = "enabled ✅" if new_status == 1 else "disabled ❌"
     await ctx.send(f"KanalKeeper {status}")
 
@@ -781,186 +1013,154 @@ async def settings(ctx):
             "SELECT * FROM guild_settings WHERE guild_id = ?", (ctx.guild.id,)
         )
         result = await cursor.fetchone()
-        
-        # Get custom words
+
         cursor = await db.execute(
             "SELECT word FROM custom_words WHERE guild_id = ?", (ctx.guild.id,)
         )
         custom_words = await cursor.fetchall()
-        
-        # Get ignored channels
+
         cursor = await db.execute(
             "SELECT channel_id FROM ignored_channels WHERE guild_id = ?", (ctx.guild.id,)
         )
         ignored = await cursor.fetchall()
 
-        # Get desired greeting channels
         cursor = await db.execute(
             "SELECT channel_id FROM greeting_channels WHERE guild_id = ?", (ctx.guild.id,)
         )
         greet_channels = await cursor.fetchall()
-    
+
     embed = discord.Embed(title="⚙️ Settings", color=discord.Color.blue())
-    
+
     if result:
-        channel = bot.get_channel(result["warning_channel_id"])
+        channel = bot.get_channel(result["warning_channel_id"]) if result["warning_channel_id"] else None
+        announce_channel = bot.get_channel(result["announce_channel_id"]) if result["announce_channel_id"] else None
         channel_mention = channel.mention if channel else "Not set"
+        announce_mention = announce_channel.mention if announce_channel else "Same as warning channel"
         status = "Enabled ✅" if result["enabled"] == 1 else "Disabled ❌"
         embed.add_field(name="Warning Channel", value=channel_mention, inline=True)
+        embed.add_field(name="Announce Channel", value=announce_mention, inline=True)
         embed.add_field(name="Status", value=status, inline=True)
     else:
         embed.add_field(name="Warning Channel", value="Not set", inline=True)
+        embed.add_field(name="Announce Channel", value="Not set", inline=True)
         embed.add_field(name="Status", value="Enabled (default)", inline=True)
-    
+
     embed.add_field(name="Warning Days", value=str(WARNING_DAYS), inline=True)
     embed.add_field(name="Reminder Day", value=f"Day {WARNING_DAYS-1}", inline=True)
-    
-    # Custom words
+    embed.add_field(name="Roll-Call Times", value="6 PM & 12 AM daily", inline=True)
+
     words_text = ", ".join([w["word"] for w in custom_words]) if custom_words else "None"
     embed.add_field(name="Custom Words", value=words_text, inline=False)
-    
-    # Ignored channels
+
     ignored_text = ", ".join([f"<#{i['channel_id']}>" for i in ignored]) if ignored else "None"
     embed.add_field(name="Ignored Channels", value=ignored_text, inline=False)
 
-    # Desired greeting channels
     greet_text = ", ".join([f"<#{g['channel_id']}>" for g in greet_channels]) if greet_channels else "None (all channels count)"
     embed.add_field(name="Greeting Channels", value=greet_text, inline=False)
-    
-    await ctx.send(embed=embed)
 
-# ========== NEW FEATURE: CUSTOM WORDS ==========
+    await ctx.send(embed=embed)
 
 @bot.command()
 @admin_check()
 async def addword(ctx, *, word: str):
-    """Add a custom greeting word for this server"""
     word = word.lower().strip()
-    
     async with aiosqlite.connect("kanalkeeper.db") as db:
-        # Check if already exists
         cursor = await db.execute(
             "SELECT 1 FROM custom_words WHERE guild_id = ? AND word = ?",
             (ctx.guild.id, word)
         )
         if await cursor.fetchone():
             return await ctx.send(f"❌ `{word}` is already a greeting word!")
-        
         await db.execute(
             "INSERT INTO custom_words (guild_id, word) VALUES (?, ?)",
             (ctx.guild.id, word)
         )
         await db.commit()
-    
     await ctx.send(f"✅ Added `{word}` as a custom greeting word!")
 
 @bot.command()
 @admin_check()
 async def removeword(ctx, *, word: str):
-    """Remove a custom greeting word"""
     word = word.lower().strip()
-    
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute(
             "DELETE FROM custom_words WHERE guild_id = ? AND word = ?",
             (ctx.guild.id, word)
         )
         await db.commit()
-    
     await ctx.send(f"✅ Removed `{word}` from custom greeting words.")
-
-# ========== NEW FEATURE: IGNORE CHANNELS ==========
 
 @bot.command()
 @mod_check()
 async def ignore(ctx, channel: discord.TextChannel):
-    """Ignore a channel from greeting tracking"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute(
             "INSERT OR IGNORE INTO ignored_channels (channel_id, guild_id) VALUES (?, ?)",
             (channel.id, ctx.guild.id)
         )
         await db.commit()
-    
     await ctx.send(f"✅ {channel.mention} is now ignored from greeting tracking.")
 
 @bot.command()
 @mod_check()
 async def unignore(ctx, channel: discord.TextChannel):
-    """Remove a channel from ignore list"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute(
             "DELETE FROM ignored_channels WHERE channel_id = ? AND guild_id = ?",
             (channel.id, ctx.guild.id)
         )
         await db.commit()
-    
     await ctx.send(f"✅ {channel.mention} is now tracked again.")
-
-# ========== NEW FEATURE: DESIRED GREETING CHANNELS ==========
 
 @bot.command()
 @mod_check()
 async def addgreetingchannel(ctx, channel: discord.TextChannel):
-    """Restrict greeting detection to this channel (multiple can be added).
-    If no greeting channels are set, all channels count by default."""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute(
             "INSERT OR IGNORE INTO greeting_channels (channel_id, guild_id) VALUES (?, ?)",
             (channel.id, ctx.guild.id)
         )
         await db.commit()
-
-    await ctx.send(f"✅ {channel.mention} added as a greeting channel. Only greetings in configured channels will count now.")
+    await ctx.send(f"✅ {channel.mention} added as a greeting channel.")
 
 @bot.command()
 @mod_check()
 async def removegreetingchannel(ctx, channel: discord.TextChannel):
-    """Remove a channel from the greeting-channel restriction list."""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute(
             "DELETE FROM greeting_channels WHERE channel_id = ? AND guild_id = ?",
             (channel.id, ctx.guild.id)
         )
         await db.commit()
-
     await ctx.send(f"✅ {channel.mention} removed from greeting channels.")
-
-# ========== NEW FEATURE: WARNING APPEAL ==========
 
 @bot.command()
 async def appeal(ctx):
-    """Request forgiveness for your warnings"""
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
-        # Check if user has warnings
         cursor = await db.execute(
             "SELECT warnings FROM users WHERE user_id = ? AND guild_id = ?",
             (ctx.author.id, ctx.guild.id)
         )
         result = await cursor.fetchone()
-        
         if not result or result[0] == 0:
             return await ctx.send("✅ You have no warnings to appeal!")
-        
-        # Check if already has pending appeal
+
         cursor = await db.execute(
             "SELECT status FROM appeals WHERE user_id = ? AND guild_id = ? AND status = 'pending'",
             (ctx.author.id, ctx.guild.id)
         )
         if await cursor.fetchone():
             return await ctx.send("⏳ You already have a pending appeal. Please wait for admin review.")
-        
-        # Create appeal
+
         await db.execute(
             "INSERT INTO appeals (user_id, guild_id, date, status) VALUES (?, ?, ?, 'pending')",
             (ctx.author.id, ctx.guild.id, datetime.now().strftime("%Y-%m-%d"))
         )
         await db.commit()
-    
-    # Notify admin channel
+
     channel_id = await get_warning_channel(ctx.guild.id)
     if channel_id:
         channel = bot.get_channel(channel_id)
@@ -973,98 +1173,82 @@ async def appeal(ctx):
             embed.add_field(name="User", value=f"{ctx.author} ({ctx.author.id})", inline=True)
             embed.add_field(name="Action", value="Use `!forgive @user` to approve", inline=False)
             await channel.send(embed=embed)
-    
-    await ctx.send("📋 Your appeal has been submitted! An admin will review it soon.")
 
-# ========== NEW FEATURE: FREEZE USER ==========
+    await ctx.send("📋 Your appeal has been submitted! An admin will review it soon.")
 
 @bot.command()
 @mod_check()
 async def freeze(ctx, member: discord.Member, days: int = 7):
-    """Pause greeting tracking for a user (vacation/break)"""
     if days < 1 or days > 30:
         return await ctx.send("❌ Freeze days must be between 1 and 30!")
-    
     frozen_until = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-    
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute("""
             UPDATE users SET frozen_until = ? WHERE user_id = ? AND guild_id = ?
         """, (frozen_until, member.id, ctx.guild.id))
         await db.commit()
-    
-    await ctx.send(f"✅ {member.mention} is frozen until **{frozen_until}**. No warnings will be issued during this time.")
+    await ctx.send(f"✅ {member.mention} is frozen until **{frozen_until}**. No warnings during this time.")
 
 @bot.command()
 @mod_check()
 async def unfreeze(ctx, member: discord.Member):
-    """Remove freeze from a user"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute("""
             UPDATE users SET frozen_until = NULL WHERE user_id = ? AND guild_id = ?
         """, (member.id, ctx.guild.id))
         await db.commit()
-    
     await ctx.send(f"✅ {member.mention} is no longer frozen. Tracking resumed!")
-
-# ========== NEW FEATURE: CLEAR ALL WARNINGS ==========
 
 @bot.command()
 @admin_check()
 async def clearall(ctx):
-    """Clear ALL warnings in this server (use for new month)"""
     async with aiosqlite.connect("kanalkeeper.db") as db:
-        # Count warnings
         cursor = await db.execute(
             "SELECT COUNT(*) FROM warnings WHERE guild_id = ?", (ctx.guild.id,)
         )
         count = (await cursor.fetchone())[0]
-        
-        # Clear all
         await db.execute("DELETE FROM warnings WHERE guild_id = ?", (ctx.guild.id,))
         await db.execute("UPDATE users SET warnings = 0 WHERE guild_id = ?", (ctx.guild.id,))
         await db.commit()
-    
     await ctx.send(f"✅ Cleared **{count}** warnings! Everyone starts fresh! 🎉")
-
-# ========== NEW FEATURE: UNMUTE USER ==========
 
 @bot.command()
 @mod_check()
 async def unmute(ctx, member: discord.Member):
-    """Manually unmute a user"""
     guild = ctx.guild
     mute_role = discord.utils.get(guild.roles, name="Muted")
-    
     if mute_role and mute_role in member.roles:
         try:
             await member.remove_roles(mute_role, reason="Manual unmute by mod")
+            async with aiosqlite.connect("kanalkeeper.db") as db:
+                await db.execute("""
+                    UPDATE users SET muted_until = NULL WHERE user_id = ? AND guild_id = ?
+                """, (member.id, guild.id))
+                await db.commit()
             await ctx.send(f"✅ {member.mention} has been unmuted!")
         except Exception as e:
             await ctx.send(f"❌ Could not unmute: {e}")
     else:
         await ctx.send("ℹ️ User is not muted.")
 
-# ========== USER COMMANDS ==========
-
 @bot.command()
 async def status(ctx):
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT * FROM users WHERE user_id = ? AND guild_id = ?", 
+            "SELECT * FROM users WHERE user_id = ? AND guild_id = ?",
             (ctx.author.id, ctx.guild.id)
         )
         data = await cursor.fetchone()
-    
+
     if not data:
         return await ctx.send("No data yet! Start greeting! 👋")
-    
+
     badge = get_badge(data['streak'])
-    
+
     embed = discord.Embed(
         title=f"📊 {ctx.author.display_name}'s Stats",
         color=discord.Color.blue()
@@ -1073,15 +1257,19 @@ async def status(ctx):
     embed.add_field(name="🔥 Streak", value=f"{data['streak']} days", inline=True)
     embed.add_field(name="⚠️ Warnings", value=str(data['warnings']), inline=True)
     embed.add_field(name="📅 Last Greeting", value=data['last_greeting'] or "Never", inline=True)
-    
-    # Check if frozen
+
     frozen_until_val = data['frozen_until'] if 'frozen_until' in data.keys() else None
     if frozen_until_val:
         frozen_date = datetime.strptime(frozen_until_val, "%Y-%m-%d")
         if frozen_date > datetime.now():
             embed.add_field(name="❄️ Frozen Until", value=frozen_until_val, inline=True)
-    
-    # Next badge
+
+    muted_until_val = data['muted_until'] if 'muted_until' in data.keys() else None
+    if muted_until_val:
+        muted_date = datetime.strptime(muted_until_val, "%Y-%m-%d %H:%M:%S")
+        if muted_date > datetime.now():
+            embed.add_field(name="🔇 Muted Until", value=muted_until_val, inline=True)
+
     if data['streak'] < 3:
         next_badge = "🪳 Ipis na Buhay (3 days)"
     elif data['streak'] < 5:
@@ -1094,34 +1282,30 @@ async def status(ctx):
         next_badge = "🦨 Amoy Imburnal (30 days)"
     else:
         next_badge = "🐀 Daga ng Kanal (50 days)"
-    
+
     embed.add_field(name="🎯 Next Badge", value=next_badge, inline=False)
-    
+
     if data['warnings'] > 0:
         embed.add_field(name="Status", value="🔴 At Risk — Say hi today!", inline=False)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
 async def leaderboard(ctx):
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
-            SELECT username, streak FROM users 
+            SELECT username, streak FROM users
             WHERE guild_id = ? ORDER BY streak DESC LIMIT 10
         """, (ctx.guild.id,))
         top_users = await cursor.fetchall()
-    
-    embed = discord.Embed(
-        title="🏆 Greeting Leaderboard",
-        color=discord.Color.gold()
-    )
-    
+
+    embed = discord.Embed(title="🏆 Greeting Leaderboard", color=discord.Color.gold())
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    
+
     for i, user in enumerate(top_users):
         badge = get_badge(user['streak'])
         embed.add_field(
@@ -1129,10 +1313,10 @@ async def leaderboard(ctx):
             value=f"🔥 {user['streak']} day streak",
             inline=False
         )
-    
+
     if not top_users:
         embed.description = "No data yet! Be first! 👋"
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1140,7 +1324,7 @@ async def leaderboard(ctx):
 async def warnlist(ctx):
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
@@ -1149,14 +1333,14 @@ async def warnlist(ctx):
             WHERE w.guild_id = ? ORDER BY w.date DESC LIMIT 20
         """, (ctx.guild.id,))
         warnings = await cursor.fetchall()
-    
+
     if not warnings:
         return await ctx.send("✅ No warnings!")
-    
+
     embed = discord.Embed(title="⚠️ Warnings", color=discord.Color.red())
     for w in warnings:
         embed.add_field(name=f"{w['username']} — {w['date']}", value=w['reason'], inline=False)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1164,25 +1348,26 @@ async def warnlist(ctx):
 async def forgive(ctx, member: discord.Member):
     if not ctx.guild:
         return await ctx.send("❌ This only works in servers!")
-    
+
     async with aiosqlite.connect("kanalkeeper.db") as db:
         await db.execute("DELETE FROM warnings WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
         await db.execute("UPDATE users SET warnings = 0 WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
         await db.commit()
-    
+
     await ctx.send(f"✅ Cleared warnings for {member.mention}")
 
 # ========== ERROR HANDLING ==========
 
 @bot.event
 async def on_command_error(ctx, error):
-    # FIX: Use discord.ext.commands.MissingPermissions directly
     if isinstance(error, discord.ext.commands.MissingPermissions):
         await ctx.send("❌ You don't have permission to use this command.")
     elif isinstance(error, discord.ext.commands.MissingRequiredArgument):
         await ctx.send(f"❌ Usage: `!{ctx.command.name} {ctx.command.signature}`")
     elif isinstance(error, discord.ext.commands.CheckFailure):
         await ctx.send("❌ You don't have permission to use this command.")
+    elif isinstance(error, discord.ext.commands.BadArgument):
+        await ctx.send(f"❌ Invalid argument. Usage: `!{ctx.command.name} {ctx.command.signature}`")
     else:
         print(f"Error: {error}")
 
@@ -1193,6 +1378,50 @@ async def on_disconnect():
 @bot.event
 async def on_resumed():
     print("✅ Reconnected!")
+
+# ========== TASK SETUP: Fix time-based loops ==========
+
+@daily_announce_6pm.before_loop
+async def before_6pm():
+    """Wait until the next 6 PM (UTC+8 = 10:00 UTC) to start the loop."""
+    await bot.wait_until_ready()
+    now = datetime.utcnow()
+    # Target: 10:00 UTC = 6:00 PM Philippine Time (UTC+8)
+    target = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    wait_seconds = (target - now).total_seconds()
+    print(f"⏰ 6 PM roll-call will fire in {wait_seconds/3600:.1f} hours")
+    await asyncio.sleep(wait_seconds)
+
+@daily_announce_midnight.before_loop
+async def before_midnight():
+    """Wait until next 12 AM (UTC+8 = 16:00 UTC) to start the loop."""
+    await bot.wait_until_ready()
+    now = datetime.utcnow()
+    # Target: 16:00 UTC = 12:00 AM Philippine Time (UTC+8)
+    target = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    wait_seconds = (target - now).total_seconds()
+    print(f"⏰ 12 AM roll-call will fire in {wait_seconds/3600:.1f} hours")
+    await asyncio.sleep(wait_seconds)
+
+@daily_check.before_loop
+async def before_daily():
+    await bot.wait_until_ready()
+
+@reminder_check.before_loop
+async def before_reminder():
+    await bot.wait_until_ready()
+
+@weekly_summary.before_loop
+async def before_weekly():
+    await bot.wait_until_ready()
+
+@auto_unmute_check.before_loop
+async def before_auto_unmute():
+    await bot.wait_until_ready()
 
 # ========== RUN ==========
 
