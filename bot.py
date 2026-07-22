@@ -575,6 +575,11 @@ async def post_daily_rollcall(label: str):
             pending = []
             for row in not_greeted:
                 member = guild.get_member(row["user_id"])
+                if not member:
+                    try:
+                        member = await guild.fetch_member(row["user_id"])
+                    except (discord.NotFound, discord.HTTPException):
+                        member = None
                 if member and not member.bot:
                     pending.append((member, row["streak"]))
 
@@ -918,7 +923,9 @@ async def commands(ctx):
             "`!addword \"word\"` — Add custom greeting\n"
             "`!removeword \"word\"` — Remove custom greeting\n"
             "`!clearall` — Reset ALL warnings (new month)\n"
-            "`!rollcall` — Post roll-call now"
+            "`!rollcall` — Post roll-call now\n"
+            "`!checksync` — Diagnose Discord/DB member mismatches\n"
+            "`!resync` — Re-sync all current members into the database"
         )
         embed.add_field(name="⚙️ Admin Commands", value=admin_cmds, inline=False)
 
@@ -999,6 +1006,60 @@ async def rollcall(ctx):
     """Manually trigger a roll-call announcement right now."""
     await ctx.send("📋 Posting roll-call now...")
     await post_daily_rollcall("Manual")
+
+@bot.command()
+@admin_check()
+async def checksync(ctx):
+    """Diagnose mismatches between Discord's member list and the local DB/cache."""
+    guild = ctx.guild
+    discord_members = [m for m in guild.members if not m.bot]
+
+    async with aiosqlite.connect("kanalkeeper.db") as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE guild_id = ?", (guild.id,)
+        )
+        db_rows = await cursor.fetchall()
+
+    db_ids = {row["user_id"] for row in db_rows}
+    discord_ids = {m.id for m in discord_members}
+
+    in_discord_not_db = discord_ids - db_ids
+    in_db_not_discord = db_ids - discord_ids
+
+    unresolved = 0
+    for uid in discord_ids:
+        if guild.get_member(uid) is None:
+            unresolved += 1
+
+    embed = discord.Embed(title="🔍 Sync Check", color=discord.Color.blurple())
+    embed.add_field(name="Discord members (non-bot)", value=str(len(discord_members)), inline=True)
+    embed.add_field(name="DB rows for this guild", value=str(len(db_ids)), inline=True)
+    embed.add_field(name="get_member() cache misses", value=str(unresolved), inline=True)
+    embed.add_field(
+        name="In Discord, missing from DB",
+        value=", ".join(str(i) for i in list(in_discord_not_db)[:10]) or "None",
+        inline=False
+    )
+    embed.add_field(
+        name="In DB, not found in Discord",
+        value=", ".join(str(i) for i in list(in_db_not_discord)[:10]) or "None",
+        inline=False
+    )
+    if in_discord_not_db:
+        embed.add_field(
+            name="💡 Tip",
+            value="Run `!resync` to add missing members to the database.",
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+@bot.command()
+@admin_check()
+async def resync(ctx):
+    """Re-sync all current guild members into the database (fixes missing rows)."""
+    await sync_guild_members(ctx.guild)
+    await ctx.send(f"✅ Re-synced {len([m for m in ctx.guild.members if not m.bot])} members for **{ctx.guild.name}**.")
 
 @bot.command()
 @admin_check()
