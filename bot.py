@@ -100,6 +100,7 @@ async def init_db():
         for col_def in [
             "ALTER TABLE users ADD COLUMN joined_at TEXT",
             "ALTER TABLE users ADD COLUMN muted_until TEXT",
+            "ALTER TABLE users ADD COLUMN last_warned TEXT",
         ]:
             try:
                 await db.execute(col_def)
@@ -653,7 +654,13 @@ async def daily_check():
                         (last_greeting IS NOT NULL AND last_greeting <= ?)
                         OR (last_greeting IS NULL AND (joined_at IS NULL OR joined_at <= ?))
                       )
-            """, (guild_id, days_ago, days_ago))
+                  AND (frozen_until IS NULL OR frozen_until <= ?)
+                  AND (
+                        last_warned IS NULL
+                        OR (last_greeting IS NOT NULL AND last_warned < last_greeting)
+                        OR (last_greeting IS NULL AND last_warned < joined_at)
+                      )
+            """, (guild_id, days_ago, days_ago, today))
 
             inactive = await cursor.fetchall()
 
@@ -685,9 +692,9 @@ async def daily_check():
                 """, (user_id, guild_id, today, f'{WARNING_DAYS} days without greetings'))
 
                 await db.execute("""
-                    UPDATE users SET warnings = ?, muted_until = ?
+                    UPDATE users SET warnings = ?, muted_until = ?, last_warned = ?
                     WHERE user_id = ? AND guild_id = ?
-                """, (warnings, muted_until_str, user_id, guild_id))
+                """, (warnings, muted_until_str, today, user_id, guild_id))
                 await db.commit()
 
                 await send_warning(guild_id, user_id, user["username"], warnings, user["last_greeting"], mute_role)
